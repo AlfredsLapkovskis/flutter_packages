@@ -94,7 +94,7 @@
 @property(nonatomic, readonly) CALayer *flutterViewLayer;
 @property(nonatomic) FlutterEventChannel *eventChannel;
 @property(nonatomic) FlutterEventSink eventSink;
-@property(nonatomic) CGAffineTransform preferredTransform;
+@property(nonatomic) int preferredOrientation;
 @property(nonatomic, readonly) BOOL disposed;
 @property(nonatomic, readonly) BOOL isPlaying;
 @property(nonatomic) BOOL isLooping;
@@ -212,50 +212,6 @@ NS_INLINE int64_t FVPCMTimeToMillis(CMTime time) {
   return time.value * 1000 / time.timescale;
 }
 
-NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
-  // Input range [-pi, pi] or [-180, 180]
-  CGFloat degrees = GLKMathRadiansToDegrees((float)radians);
-  if (degrees < 0) {
-    // Convert -90 to 270 and -180 to 180
-    return degrees + 360;
-  }
-  // Output degrees in between [0, 360]
-  return degrees;
-};
-
-- (AVMutableVideoComposition *)getVideoCompositionWithTransform:(CGAffineTransform)transform
-                                                      withAsset:(AVAsset *)asset
-                                                 withVideoTrack:(AVAssetTrack *)videoTrack {
-  AVMutableVideoCompositionInstruction *instruction =
-      [AVMutableVideoCompositionInstruction videoCompositionInstruction];
-  instruction.timeRange = CMTimeRangeMake(kCMTimeZero, [asset duration]);
-  AVMutableVideoCompositionLayerInstruction *layerInstruction =
-      [AVMutableVideoCompositionLayerInstruction
-          videoCompositionLayerInstructionWithAssetTrack:videoTrack];
-  [layerInstruction setTransform:_preferredTransform atTime:kCMTimeZero];
-
-  AVMutableVideoComposition *videoComposition = [AVMutableVideoComposition videoComposition];
-  instruction.layerInstructions = @[ layerInstruction ];
-  videoComposition.instructions = @[ instruction ];
-
-  // If in portrait mode, switch the width and height of the video
-  CGFloat width = videoTrack.naturalSize.width;
-  CGFloat height = videoTrack.naturalSize.height;
-  NSInteger rotationDegrees =
-      (NSInteger)round(radiansToDegrees(atan2(_preferredTransform.b, _preferredTransform.a)));
-  if (rotationDegrees == 90 || rotationDegrees == 270) {
-    width = videoTrack.naturalSize.height;
-    height = videoTrack.naturalSize.width;
-  }
-  videoComposition.renderSize = CGSizeMake(width, height);
-
-  // TODO(@recastrodiaz): should we use videoTrack.nominalFrameRate ?
-  // Currently set at a constant 30 FPS
-  videoComposition.frameDuration = CMTimeMake(1, 30);
-
-  return videoComposition;
-}
-
 - (instancetype)initWithURL:(NSURL *)url
                frameUpdater:(FVPFrameUpdater *)frameUpdater
                 displayLink:(FVPDisplayLink *)displayLink
@@ -296,17 +252,7 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
           if (self->_disposed) return;
           if ([videoTrack statusOfValueForKey:@"preferredTransform"
                                         error:nil] == AVKeyValueStatusLoaded) {
-            // Rotate the video by using a videoComposition and the preferredTransform
-            self->_preferredTransform = FVPGetStandardizedTransformForTrack(videoTrack);
-            // Note:
-            // https://developer.apple.com/documentation/avfoundation/avplayeritem/1388818-videocomposition
-            // Video composition can only be used with file-based media and is not supported for
-            // use with media served using HTTP Live Streaming.
-            AVMutableVideoComposition *videoComposition =
-                [self getVideoCompositionWithTransform:self->_preferredTransform
-                                             withAsset:asset
-                                        withVideoTrack:videoTrack];
-            item.videoComposition = videoComposition;
+            self->_preferredOrientation = FVPGetOrientationForTrack(videoTrack);
           }
         };
         [videoTrack loadValuesAsynchronouslyForKeys:@[ @"preferredTransform" ]
@@ -581,6 +527,34 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
     // paused, stop it again.
     if (!self.isPlaying) {
       self.displayLink.running = NO;
+    }
+  }
+    
+  if (buffer) {
+    @autoreleasepool {
+      CIImage* image = [CIImage imageWithCVPixelBuffer:buffer];
+      image = [image imageByApplyingOrientation:_preferredOrientation];
+      CVBufferRelease(buffer);
+      
+      NSDictionary *pixBuffAttributes = @{
+        (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferIOSurfacePropertiesKey : @{}
+      };
+      CVPixelBufferRef destination;
+      CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault,
+                                            (size_t)image.extent.size.width,
+                                            (size_t)image.extent.size.height,
+                                            CVPixelBufferGetPixelFormatType(buffer),
+                                            (__bridge CFDictionaryRef)pixBuffAttributes, &destination);
+      
+      if (status != kCVReturnSuccess) {
+        return NULL;
+      }
+      
+      CIContext* context = [[CIContext alloc] init];
+      [context render:image toCVPixelBuffer:destination];
+      
+      return destination;
     }
   }
 
