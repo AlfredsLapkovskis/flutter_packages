@@ -90,11 +90,9 @@
 @property(readonly, nonatomic) AVPlayerItemVideoOutput *videoOutput;
 // The plugin registrar, to obtain view information from.
 @property(nonatomic, weak) NSObject<FlutterPluginRegistrar> *registrar;
-// The CALayer associated with the Flutter view this plugin is associated with, if any.
-@property(nonatomic, readonly) CALayer *flutterViewLayer;
 @property(nonatomic) FlutterEventChannel *eventChannel;
 @property(nonatomic) FlutterEventSink eventSink;
-@property(nonatomic) int preferredOrientation;
+@property(nonatomic) CGAffineTransform preferredTransform;
 @property(nonatomic, readonly) BOOL disposed;
 @property(nonatomic, readonly) BOOL isPlaying;
 @property(nonatomic) BOOL isLooping;
@@ -212,6 +210,50 @@ NS_INLINE int64_t FVPCMTimeToMillis(CMTime time) {
   return time.value * 1000 / time.timescale;
 }
 
+NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
+  // Input range [-pi, pi] or [-180, 180]
+  CGFloat degrees = GLKMathRadiansToDegrees((float)radians);
+  if (degrees < 0) {
+    // Convert -90 to 270 and -180 to 180
+    return degrees + 360;
+  }
+  // Output degrees in between [0, 360]
+  return degrees;
+};
+
+- (AVMutableVideoComposition *)getVideoCompositionWithTransform:(CGAffineTransform)transform
+                                                      withAsset:(AVAsset *)asset
+                                                 withVideoTrack:(AVAssetTrack *)videoTrack {
+  AVMutableVideoCompositionInstruction *instruction =
+      [AVMutableVideoCompositionInstruction videoCompositionInstruction];
+  instruction.timeRange = CMTimeRangeMake(kCMTimeZero, [asset duration]);
+  AVMutableVideoCompositionLayerInstruction *layerInstruction =
+      [AVMutableVideoCompositionLayerInstruction
+          videoCompositionLayerInstructionWithAssetTrack:videoTrack];
+  [layerInstruction setTransform:_preferredTransform atTime:kCMTimeZero];
+
+  AVMutableVideoComposition *videoComposition = [AVMutableVideoComposition videoComposition];
+  instruction.layerInstructions = @[ layerInstruction ];
+  videoComposition.instructions = @[ instruction ];
+
+  // If in portrait mode, switch the width and height of the video
+  CGFloat width = videoTrack.naturalSize.width;
+  CGFloat height = videoTrack.naturalSize.height;
+  NSInteger rotationDegrees =
+      (NSInteger)round(radiansToDegrees(atan2(_preferredTransform.b, _preferredTransform.a)));
+  if (rotationDegrees == 90 || rotationDegrees == 270) {
+    width = videoTrack.naturalSize.height;
+    height = videoTrack.naturalSize.width;
+  }
+  videoComposition.renderSize = CGSizeMake(width, height);
+
+  // TODO(@recastrodiaz): should we use videoTrack.nominalFrameRate ?
+  // Currently set at a constant 30 FPS
+  videoComposition.frameDuration = CMTimeMake(1, 30);
+
+  return videoComposition;
+}
+
 - (instancetype)initWithURL:(NSURL *)url
                frameUpdater:(FVPFrameUpdater *)frameUpdater
                 displayLink:(FVPDisplayLink *)displayLink
@@ -252,7 +294,17 @@ NS_INLINE int64_t FVPCMTimeToMillis(CMTime time) {
           if (self->_disposed) return;
           if ([videoTrack statusOfValueForKey:@"preferredTransform"
                                         error:nil] == AVKeyValueStatusLoaded) {
-            self->_preferredOrientation = FVPGetOrientationForTrack(videoTrack);
+            // Rotate the video by using a videoComposition and the preferredTransform
+            self->_preferredTransform = FVPGetStandardizedTransformForTrack(videoTrack);
+            // Note:
+            // https://developer.apple.com/documentation/avfoundation/avplayeritem/1388818-videocomposition
+            // Video composition can only be used with file-based media and is not supported for
+            // use with media served using HTTP Live Streaming.
+            AVMutableVideoComposition *videoComposition =
+                [self getVideoCompositionWithTransform:self->_preferredTransform
+                                             withAsset:asset
+                                        withVideoTrack:videoTrack];
+            item.videoComposition = videoComposition;
           }
         };
         [videoTrack loadValuesAsynchronouslyForKeys:@[ @"preferredTransform" ]
@@ -263,14 +315,6 @@ NS_INLINE int64_t FVPCMTimeToMillis(CMTime time) {
 
   _player = [avFactory playerWithPlayerItem:item];
   _player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
-
-  // This is to fix 2 bugs: 1. blank video for encrypted video streams on iOS 16
-  // (https://github.com/flutter/flutter/issues/111457) and 2. swapped width and height for some
-  // video streams (not just iOS 16).  (https://github.com/flutter/flutter/issues/109116). An
-  // invisible AVPlayerLayer is used to overwrite the protection of pixel buffers in those streams
-  // for issue #1, and restore the correct width and height for issue #2.
-  _playerLayer = [AVPlayerLayer playerLayerWithPlayer:_player];
-  [self.flutterViewLayer addSublayer:_playerLayer];
 
   // Configure output.
   _displayLink = displayLink;
@@ -529,34 +573,6 @@ NS_INLINE int64_t FVPCMTimeToMillis(CMTime time) {
       self.displayLink.running = NO;
     }
   }
-    
-  if (buffer) {
-    @autoreleasepool {
-      CIImage* image = [CIImage imageWithCVPixelBuffer:buffer];
-      image = [image imageByApplyingOrientation:_preferredOrientation];
-      CVBufferRelease(buffer);
-      
-      NSDictionary *pixBuffAttributes = @{
-        (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
-        (id)kCVPixelBufferIOSurfacePropertiesKey : @{}
-      };
-      CVPixelBufferRef destination;
-      CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault,
-                                            (size_t)image.extent.size.width,
-                                            (size_t)image.extent.size.height,
-                                            CVPixelBufferGetPixelFormatType(buffer),
-                                            (__bridge CFDictionaryRef)pixBuffAttributes, &destination);
-      
-      if (status != kCVReturnSuccess) {
-        return NULL;
-      }
-      
-      CIContext* context = [[CIContext alloc] init];
-      [context render:image toCVPixelBuffer:destination];
-      
-      return destination;
-    }
-  }
 
   return buffer;
 }
@@ -597,7 +613,6 @@ NS_INLINE int64_t FVPCMTimeToMillis(CMTime time) {
   }
 
   _disposed = YES;
-  [_playerLayer removeFromSuperlayer];
   _displayLink = nil;
   [self removeKeyValueObservers];
 
@@ -608,20 +623,6 @@ NS_INLINE int64_t FVPCMTimeToMillis(CMTime time) {
 - (void)dispose {
   [self disposeSansEventChannel];
   [_eventChannel setStreamHandler:nil];
-}
-
-- (CALayer *)flutterViewLayer {
-#if TARGET_OS_OSX
-  return self.registrar.view.layer;
-#else
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-  // TODO(hellohuanlin): Provide a non-deprecated codepath. See
-  // https://github.com/flutter/flutter/issues/104117
-  UIViewController *root = UIApplication.sharedApplication.keyWindow.rootViewController;
-#pragma clang diagnostic pop
-  return root.view.layer;
-#endif
 }
 
 /// Removes all key-value observers set up for the player.
